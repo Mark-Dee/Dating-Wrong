@@ -542,7 +542,7 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
 
     try {
       const res = await fetch('/api/payments/pochi/submit-sms', {
-        method: 'get',
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           uid,

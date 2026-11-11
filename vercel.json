@@ -1,0 +1,8 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "routes": [
+    { "src": "/api/(.*)", "status": 404 },
+    { "src": "/(.*)", "dest": "/index.html" }
+  ]
+}

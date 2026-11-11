@@ -1,0 +1,16 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "ignore": ["node_modules", ".git", "firebase-debug.log", "firebase-debug.*.log"],
+      "predeploy": ["npm --prefix \"$RESOURCE_DIR\" run build"]
+    }
+  ],
+  "firestore": [
+    {
+      "database": "ai-studio-datingwrongbyger-7148f8d1-9dc9-4edc-9876-4352495da2c9",
+      "rules": "firestore.rules"
+    }
+  ]
+}

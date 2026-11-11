@@ -34,7 +34,9 @@ import {
 import { useAuth } from '../context/AuthContext.tsx';
 import { useBodyScrollLock } from '../hooks/useBodyScrollLock.ts';
 import { doc, collection, onSnapshot, setDoc, deleteDoc, getDocs, query, where, serverTimestamp, addDoc, orderBy, limit } from 'firebase/firestore';
+import { httpsCallable } from 'firebase/functions';
 import { db } from '../services/firebase.ts';
+import { functions } from '../services/firebase.ts';
 
 export interface AuthorizedAdmin {
   email: string;
@@ -686,17 +688,6 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
         setPochiPendingCount(liveRequests.filter((r) => r.status === 'PENDING_REVIEW').length);
       }
 
-      // 2. Also query backend API
-      const res = await fetch('/api/admin/payment-requests', { headers: adminHeaders });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.requests && data.requests.length > 0) {
-          setPaymentRequests((curr) => (curr.length === 0 ? data.requests : curr));
-          if (data.counts?.pending !== undefined) {
-            setPochiPendingCount((curr) => (curr === 0 ? data.counts.pending : curr));
-          }
-        }
-      }
     } catch (err) {
       console.error('Failed to fetch payment requests:', err);
     }
@@ -708,105 +699,8 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
     setSuccessMsg(null);
     const approvingEmail = activeAdminEmail.trim().toLowerCase();
     try {
-      const res = await fetch(`/api/admin/payment-requests/${requestId}/approve`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-admin-email': approvingEmail,
-          'x-user-role': currentAdminRole,
-        },
-        body: JSON.stringify({
-          adminEmail: approvingEmail,
-          adminName: approvingEmail,
-          baseUrl: window.location.origin,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to approve request');
-      }
-
-      // Propagate immediately to Firestore collection so all admin devices reflect instantly
-      // Storing the EXACT administrator email who performed the approval!
-      try {
-        await setDoc(
-          doc(db, 'paymentRequests', requestId),
-          {
-            status: 'APPROVED',
-            reviewedBy: approvingEmail,
-            reviewedAt: new Date().toISOString(),
-            entitlementId: data.entitlement?.paymentId || `ENT-${Date.now()}`,
-          },
-          { merge: true }
-        );
-
-        // Immediate client entitlement authorization in Firestore collections
-        const targetReq = paymentRequests.find((r) => r.requestId === requestId);
-        const customerEmail = (targetReq?.email || data.entitlement?.email || '').trim().toLowerCase();
-        const customerUid = targetReq?.uid || data.entitlement?.uid || '';
-
-        if (customerUid) {
-          try {
-            await setDoc(
-              doc(db, 'bookEntitlements', `${customerUid}_dating-wrong`),
-              {
-                bookId: 'dating-wrong',
-                grantedAt: new Date().toISOString(),
-                source: 'pochi_verified',
-                status: 'active',
-                uid: customerUid,
-                userEmail: customerEmail,
-                approvedBy: approvingEmail,
-                watermark: `Authorized Digital Edition • ${customerEmail} • Dating Wrong`,
-              },
-              { merge: true }
-            );
-            await setDoc(
-              doc(db, 'users', customerUid),
-              {
-                hasAccess: true,
-                accessStatus: 'ACTIVE',
-                approvedBy: approvingEmail,
-                approvedAt: new Date().toISOString(),
-              },
-              { merge: true }
-            );
-          } catch (uErr) {
-            console.warn('Firestore user entitlement notice:', uErr);
-          }
-        }
-
-        if (customerEmail) {
-          try {
-            await addDoc(collection(db, 'entitlements'), {
-              entitlementId: data.entitlement?.paymentId || `ENT-${Date.now()}`,
-              userId: customerUid || `USR-${Date.now()}`,
-              email: customerEmail,
-              name: targetReq?.customerName || 'Authorized Reader',
-              bookId: 'dating-wrong',
-              status: 'active',
-              grantedAt: new Date().toISOString(),
-              approvedBy: approvingEmail,
-              watermarkText: `Authorized Digital Edition • ${customerEmail} • Dating Wrong`,
-            });
-          } catch (eErr) {
-            console.warn('Firestore entitlements collection notice:', eErr);
-          }
-        }
-
-        // Broadcast action to all admins' displays
-        await addDoc(collection(db, 'adminActions'), {
-          actionType: 'APPROVE',
-          performedBy: approvingEmail,
-          requestId,
-          customerEmail: targetReq?.email || '',
-          customerName: targetReq?.customerName || '',
-          description: `${approvingEmail} approved digital book access for ${targetReq?.email || targetReq?.customerName || 'reader'}`,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (fErr: any) {
-        console.warn('Firestore real-time approve sync notice:', fErr.message);
-      }
+      const approvePayment = httpsCallable(functions, 'approvePayment');
+      await approvePayment({ requestId });
 
       setSuccessMsg(`Payment request approved! Reader entitlement granted. Mapped to approver: ${approvingEmail}`);
       await fetchPaymentRequests();
@@ -830,37 +724,14 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
     setSuccessMsg(null);
     const rejectingEmail = activeAdminEmail.trim().toLowerCase();
     try {
-      const res = await fetch(`/api/admin/payment-requests/${requestId}/reject`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-admin-email': rejectingEmail,
-          'x-user-role': currentAdminRole,
-        },
-        body: JSON.stringify({
-          adminEmail: rejectingEmail,
-          adminName: rejectingEmail,
-          reason: reason.trim() || 'Payment could not be verified in Pochi records.',
-        }),
+      const rejectPayment = httpsCallable(functions, 'rejectPayment');
+      await rejectPayment({
+        requestId,
+        reason: reason.trim() || 'Payment could not be verified in Pochi records.',
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to reject request');
-      }
 
       // Propagate immediately to Firestore collection so all admin devices reflect instantly
       try {
-        await setDoc(
-          doc(db, 'paymentRequests', requestId),
-          {
-            status: 'REJECTED',
-            reviewedBy: rejectingEmail,
-            reviewedAt: new Date().toISOString(),
-            rejectionReason: reason.trim() || 'Payment could not be verified in Pochi records.',
-          },
-          { merge: true }
-        );
-
         // Broadcast action to all admins' displays
         const targetReq = paymentRequests.find((r) => r.requestId === requestId);
         await addDoc(collection(db, 'adminActions'), {
@@ -897,30 +768,11 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
     setIsReassigning(true);
     const cleanEmail = newApproverEmail.trim().toLowerCase();
     try {
-      const res = await fetch(`/api/admin/payment-requests/${requestId}/reassign-approver`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-admin-email': activeAdminEmail,
-          'x-user-role': currentAdminRole,
-        },
-        body: JSON.stringify({ adminEmail: cleanEmail }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to reassign approver');
-      }
+      const reassignPaymentApprover = httpsCallable(functions, 'reassignPaymentApprover');
+      await reassignPaymentApprover({ requestId, adminEmail: cleanEmail });
 
       // Update Firestore document as well
       try {
-        await setDoc(
-          doc(db, 'paymentRequests', requestId),
-          {
-            reviewedBy: cleanEmail,
-          },
-          { merge: true }
-        );
-
         // Broadcast action to all admins' displays
         await addDoc(collection(db, 'adminActions'), {
           actionType: 'REASSIGN',

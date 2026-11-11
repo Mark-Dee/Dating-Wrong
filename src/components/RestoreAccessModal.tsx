@@ -15,6 +15,8 @@ import {
 import { UserEntitlement } from '../types.ts';
 import { useAuth } from '../context/AuthContext.tsx';
 import { parseMpesaSms } from '../utils/mpesaSmsParser.ts';
+import { httpsCallable } from 'firebase/functions';
+import { functions } from '../services/firebase.ts';
 import { useBodyScrollLock } from '../hooks/useBodyScrollLock.ts';
 
 interface RestoreAccessModalProps {
@@ -101,21 +103,18 @@ export const RestoreAccessModal: React.FC<RestoreAccessModalProps> = ({
     setIsVerifying(true);
 
     try {
-      // Query database of approved accounts via backend endpoint
-      const res = await fetch('/api/payments/pochi/restore-by-sms', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: activeEmail,
-          smsText: pastedSms.trim(),
-          uid: currentUser?.uid,
-        }),
-      });
-
-      const data = await res.json();
+      const restorePayment = httpsCallable(functions, 'restorePaymentBySms');
+      const response = await restorePayment({ email: activeEmail, submittedSms: pastedSms.trim() });
+      const data = response.data as {
+        approved?: boolean;
+        entitlement?: unknown;
+        parsedDetails?: { senderName?: string; senderPhone?: string; transactionCode?: string; amount?: number };
+        reason?: string;
+        message?: string;
+      };
 
       // Case 1: Approved account found and mapped in database!
-      if (res.ok && data.approved && data.entitlement) {
+      if (data.approved && data.entitlement) {
         const ent = await grantUserEntitlement({
           name: currentUser?.displayName || data.parsedDetails?.senderName || 'Authorized Reader',
           phone: data.parsedDetails?.senderPhone || '0701870142',

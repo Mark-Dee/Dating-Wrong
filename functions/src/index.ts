@@ -10,7 +10,9 @@ if (getApps().length === 0) {
   initializeApp();
 }
 
-const db = getFirestore();
+const FIRESTORE_DATABASE_ID =
+  process.env.FIRESTORE_DATABASE_ID || 'ai-studio-datingwrongbyger-7148f8d1-9dc9-4edc-9876-4352495da2c9';
+const db = getFirestore(undefined, FIRESTORE_DATABASE_ID);
 
 // System-wide default configuration
 export const BOOK_PRICE_KES = 750;
@@ -1024,6 +1026,38 @@ export const rejectPayment = onCall({ cors: true }, async (request) => {
 });
 
 export const rejectPaymentRequest = rejectPayment;
+
+export const reassignPaymentApprover = onCall({ cors: true }, async (request) => {
+  if (!request.auth || !request.auth.token.email) {
+    throw new HttpsError('unauthenticated', 'Admin authentication required.');
+  }
+
+  if (!isAdministrator(request.auth.token.email)) {
+    throw new HttpsError('permission-denied', 'Only authorized administrators can reassign approvals.');
+  }
+
+  const { requestId, adminEmail } = request.data || {};
+  const assignedEmail = typeof adminEmail === 'string' ? adminEmail.trim().toLowerCase() : '';
+  if (!requestId || !assignedEmail) {
+    throw new HttpsError('invalid-argument', 'Request ID and approver email are required.');
+  }
+  if (!isAdministrator(assignedEmail)) {
+    throw new HttpsError('invalid-argument', 'The assigned email must belong to an authorized administrator.');
+  }
+
+  const requestRef = db.collection('paymentRequests').doc(requestId);
+  const requestSnapshot = await requestRef.get();
+  if (!requestSnapshot.exists) {
+    throw new HttpsError('not-found', `Payment request ${requestId} not found.`);
+  }
+
+  await requestRef.update({
+    reviewedBy: assignedEmail,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
+  return { success: true, requestId, reviewedBy: assignedEmail };
+});
 
 // ============================================================================
 // 6. CALLABLE CLOUD FUNCTION: restorePaymentBySms

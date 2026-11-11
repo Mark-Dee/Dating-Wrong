@@ -21,8 +21,9 @@ import { BookMetadata, UserEntitlement } from '../types.ts';
 import { EntitlementService } from '../services/entitlementService.ts';
 import { useAuth } from '../context/AuthContext.tsx';
 import { parseMpesaSms } from '../utils/mpesaSmsParser.ts';
-import { doc, setDoc, serverTimestamp, onSnapshot } from 'firebase/firestore';
-import { db } from '../services/firebase.ts';
+import { collection, doc, getDoc, getDocs, onSnapshot, query, where } from 'firebase/firestore';
+import { httpsCallable } from 'firebase/functions';
+import { db, functions } from '../services/firebase.ts';
 import { useBodyScrollLock } from '../hooks/useBodyScrollLock.ts';
 
 interface PurchaseModalProps {
@@ -149,22 +150,6 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
   // Polling ref to clear interval
   const pollTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Fetch live Pochi configuration
-  useEffect(() => {
-    if (isOpen) {
-      fetch('/api/config/pochi')
-        .then((res) => (res.ok ? res.json() : null))
-        .then((data) => {
-          if (data) {
-            setPochiConfig(data);
-          }
-        })
-        .catch(() => {
-          // Fallback to defaults
-        });
-    }
-  }, [isOpen]);
-
   // Initial step determination based on Google Authentication
   useEffect(() => {
     if (isOpen) {
@@ -190,11 +175,13 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
           }
 
           // Check if user already has a pending Pochi request
-          fetch(`/api/payments/pochi/user-requests?uid=${currentUser.uid}&email=${encodeURIComponent(currentUser.email!)}`)
-            .then((res) => (res.ok ? res.json() : null))
-            .then((data) => {
-              if (data?.requests && data.requests.length > 0) {
-                const latest = data.requests[0];
+          getDocs(query(collection(db, 'paymentRequests'), where('uid', '==', currentUser.uid)))
+            .then((snapshot) => {
+              const requests = snapshot.docs
+                .map((requestDoc) => requestDoc.data())
+                .sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+              if (requests.length > 0) {
+                const latest = requests[0];
                 if (latest.status === 'PENDING_REVIEW') {
                   setActiveRequest({
                     requestId: latest.requestId,
@@ -290,28 +277,28 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
   const checkRequestStatus = async (requestId: string) => {
     setPollCount((prev) => prev + 1);
     try {
-      const res = await fetch(`/api/payments/pochi/request-status/${requestId}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.status === 'APPROVED') {
+      const requestSnapshot = await getDoc(doc(db, 'paymentRequests', requestId));
+      if (requestSnapshot.exists()) {
+        const request = requestSnapshot.data();
+        if (request.status === 'APPROVED') {
           if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
           }
-          await handleRequestApproved(data.request);
-        } else if (data.status === 'REJECTED') {
+          await handleRequestApproved(request);
+        } else if (request.status === 'REJECTED') {
           if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
           }
           setActiveRequest((prev) =>
-            prev ? { ...prev, status: 'REJECTED', rejectionReason: data.request.rejectionReason } : null
+            prev ? { ...prev, status: 'REJECTED', rejectionReason: request.rejectionReason } : null
           );
           const targetEmail = activeRequest?.email || currentUser?.email || emailInput || 'your Google account';
           setPendingNotice(null);
           setRedirectNotice(null);
           setErrorMsg(
-            `Transaction code ${activeRequest?.transactionCode || ''} could not be verified: ${data.request.rejectionReason || 'Transaction code not found in our accounts.'} A formal notification email has been sent to ${targetEmail}.`
+            `Transaction code ${activeRequest?.transactionCode || ''} could not be verified: ${request.rejectionReason || 'Transaction code not found in our accounts.'} A formal notification email has been sent to ${targetEmail}.`
           );
         }
       }
@@ -328,24 +315,24 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
     setRedirectNotice(null);
 
     try {
-      const res = await fetch(`/api/payments/pochi/request-status/${requestId}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.status === 'APPROVED') {
+      const requestSnapshot = await getDoc(doc(db, 'paymentRequests', requestId));
+      if (requestSnapshot.exists()) {
+        const request = requestSnapshot.data();
+        if (request.status === 'APPROVED') {
           if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
           }
-          await handleRequestApproved(data.request);
-        } else if (data.status === 'REJECTED') {
+          await handleRequestApproved(request);
+        } else if (request.status === 'REJECTED') {
           if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
           }
           setActiveRequest((prev) =>
-            prev ? { ...prev, status: 'REJECTED', rejectionReason: data.request.rejectionReason } : null
+            prev ? { ...prev, status: 'REJECTED', rejectionReason: request.rejectionReason } : null
           );
-          const reason = data.request.rejectionReason || 'Transaction code not found in our accounts.';
+          const reason = request.rejectionReason || 'Transaction code not found in our accounts.';
           const targetEmail = activeRequest?.email || currentUser?.email || emailInput || 'your Google account';
           setPendingNotice(null);
           setRedirectNotice(null);
@@ -541,58 +528,25 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
     setIsSubmittingSms(true);
 
     try {
-      const res = await fetch('/api/payments/pochi/submit-sms', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          uid,
-          email: activeEmail,
-          customerName: name.trim() || activeUser?.displayName || currentUser?.displayName || 'Valued Reader',
-          submittedSms: pastedSms.trim(),
-          senderPhone: phone.trim() || undefined,
-        }),
+      const submitPayment = httpsCallable(functions, 'submitPayment');
+      const response = await submitPayment({
+        uid,
+        email: activeEmail,
+        customerName: name.trim() || activeUser?.displayName || currentUser?.displayName || 'Valued Reader',
+        submittedSms: pastedSms.trim(),
+        senderPhone: phone.trim() || undefined,
       });
+      const data = response.data as {
+        requestId: string;
+        parsedDetails?: {
+          transactionCode?: string;
+          amount?: number;
+          senderPhone?: string;
+          transactionTime?: string;
+        };
+      };
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to submit SMS for verification.');
-      }
-
-      // If user was already entitled on server
-      if (data.alreadyAuthorized && data.entitlement) {
-        await handleRequestApproved(data.request || { transactionCode: data.entitlement.transactionCode });
-        return;
-      }
-
-      const reqId = data.requestId || data.request?.requestId || `REQ-${Date.now()}`;
-
-      // Store in Firestore 'paymentRequests' collection as PENDING_REVIEW
-      try {
-        await setDoc(doc(db, 'paymentRequests', reqId), {
-          requestId: reqId,
-          uid,
-          email: activeEmail,
-          customerName: name.trim() || activeUser?.displayName || currentUser?.displayName || 'Valued Reader',
-          submittedSms: pastedSms.trim(),
-          transactionCode: data.parsedDetails?.transactionCode || 'PENDING',
-          amount: data.parsedDetails?.amount || pochiConfig.priceKes,
-          expectedAmount: pochiConfig.priceKes,
-          senderPhone: data.parsedDetails?.senderPhone || phone,
-          senderName: data.parsedDetails?.senderName || name.trim() || '',
-          recipientDetails: pochiConfig.pochiName || 'Alvis Njagi',
-          transactionTime: data.parsedDetails?.transactionTime || 'Stated in SMS',
-          submittedAt: new Date().toISOString(),
-          status: 'PENDING_REVIEW',
-          reviewedBy: null,
-          reviewedAt: null,
-          rejectionReason: null,
-          entitlementId: null,
-          notifiedAdmins: ['Mark', 'Gerishon Wanyeki', 'Alvis Njagi'],
-          createdAt: serverTimestamp(),
-        });
-      } catch (firestoreErr) {
-        console.warn('Firestore paymentRequests write notice:', firestoreErr);
-      }
+      const reqId = data.requestId;
 
       // Set active request and enter pending approval state
       setActiveRequest({
